@@ -11,7 +11,7 @@ Pushes to the `master` branch automatically trigger the main parent orchestrator
 The automated pipeline executes the following steps:
 1.  **Build:** Builds three container images in parallel:
     - The `ingestion-helper` service.
-    - The `import-helper` service.
+    - The `aggregation-helper` job.
     - The Dataflow Flex Template used for Spanner data ingestion.
 2.  **Staging Deployment:** Deploys the services and workflows to the Staging environment (`datcom-ci` project) using staging configurations.
 3.  **Integration Testing:** Runs the end-to-end integration test suite (`spanner_ingestion_test.py`) against the Staging environment inside a `uv`-enabled container.
@@ -60,13 +60,9 @@ _VERSION=dev-<your-name>
 ### Step 3: Run the Integration Tests
 Once the staging deployment completes, execute the integration test runner from your local terminal. The runner uses **`uv`** to manage its execution environment:
 
+#### Ingestion Workflow Test:
 ```bash
 # Inside pipeline/workflow/
 uv run python spanner_ingestion_test.py
 ```
-
-#### What the test runner does:
-1.  **Environment Setup:** `uv` automatically creates a virtual environment and installs the required dependencies (`google-cloud-spanner`, `google-cloud-workflows`, and `absl-py`) defined in `pyproject.toml`.
-2.  **Database Cleanup:** Deletes existing test import records in the staging Spanner database.
-3.  **Workflow Triggering:** Connects to GCP and triggers the staging Cloud Workflows (`import-automation-workflow` and `spanner-ingestion-workflow`).
-4.  **Verification:** Polls the workflows for completion and queries the staging Spanner database to verify the ingested data is marked as `SUCCESS`.
+- **What it does:** Cleans up `ImportStatus`, `ImportVersionHistory`, and `IngestionHistory` for the test import, triggers `spanner-ingestion-workflow-staging` directly with the test import version, and verifies that `ImportStatus` is updated to `SUCCESS` and logged in `IngestionHistory`.

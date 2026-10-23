@@ -4,6 +4,7 @@ import com.google.gson.Gson;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import dev.failsafe.Failsafe;
+import dev.failsafe.FailsafeException;
 import dev.failsafe.RetryPolicy;
 import java.io.IOException;
 import java.net.URI;
@@ -19,6 +20,7 @@ import org.apache.logging.log4j.Logger;
 // the Data Commons API.
 public class ApiHelper {
   private static final Logger logger = LogManager.getLogger(ApiHelper.class);
+  private static final Gson GSON = new Gson();
   private static final String NODE_API_PATH = "/v2/node";
 
   // Retry configuration
@@ -55,7 +57,8 @@ public class ApiHelper {
       String nextToken,
       DcApiConfig config)
       throws IOException, InterruptedException {
-    var request = buildPropertyValuesRequest(nodes, property, nextToken, config);
+    String requestBody = buildPropertyValuesBody(nodes, property, nextToken);
+    var request = buildPropertyValuesRequest(requestBody, config);
 
     // maxRetries = 0 means no retries (only initial attempt)
     // maxRetries = 3 means 4 total attempts (1 initial + 3 retries)
@@ -63,8 +66,9 @@ public class ApiHelper {
 
     RetryPolicy<HttpResponse<String>> retryPolicy =
         RetryPolicy.<HttpResponse<String>>builder()
-            // TODO: Retry transient HTTP responses such as 429 and 5xx.
             .handle(IOException.class)
+            .handleResultIf(
+                response -> Set.of(408, 429, 500, 502, 503, 504).contains(response.statusCode()))
             .withMaxRetries(maxRetries)
             // Exponential backoff: 1s, 2s, 4s, 8s, 8s... (doubles each retry, capped at
             // MAX_RETRY_DELAY_SECONDS)
@@ -72,31 +76,71 @@ public class ApiHelper {
                 Duration.ofSeconds(INITIAL_RETRY_DELAY_SECONDS),
                 Duration.ofSeconds(MAX_RETRY_DELAY_SECONDS))
             .onRetry(
-                event -> {
-                  logger.warn(
-                      "API call failed (attempt "
-                          + (event.getAttemptCount() + 1)
-                          + "/"
-                          + (maxRetries + 1)
-                          + "), retrying: "
-                          + event.getLastException().getMessage());
-                })
+                event ->
+                    logger.warn(
+                        "DC API call to {} failed; retrying (attempt {}/{}): {}",
+                        request.uri(),
+                        event.getAttemptCount() + 1,
+                        maxRetries + 1,
+                        event.getLastException() != null
+                            ? event.getLastException().getMessage()
+                            : "HTTP " + event.getLastResult().statusCode()))
             .build();
 
-    var response =
-        Failsafe.with(retryPolicy)
-            .get(
-                () -> {
-                  return httpClient.send(request, HttpResponse.BodyHandlers.ofString());
-                });
+    HttpResponse<String> response = null;
+    try {
+      response =
+          Failsafe.with(retryPolicy)
+              .get(() -> httpClient.send(request, HttpResponse.BodyHandlers.ofString()));
 
-    V2NodeResponse v2Response = new Gson().fromJson(response.body().trim(), V2NodeResponse.class);
-    if (v2Response == null || v2Response.data == null) return null;
-    return v2Response;
+      if (response.statusCode() != 200) {
+        logFailure(request, requestBody, response, "Unexpected HTTP status", null);
+        return null;
+      }
+
+      V2NodeResponse v2Response = GSON.fromJson(response.body().trim(), V2NodeResponse.class);
+      if (v2Response == null || v2Response.data == null) {
+        logFailure(request, requestBody, response, "Missing response data", null);
+        return null;
+      }
+      return v2Response;
+    } catch (Exception e) {
+      logFailure(request, requestBody, response, "Request or response parsing failed", e);
+      if (e instanceof FailsafeException && e.getCause() instanceof IOException cause) {
+        throw cause;
+      }
+      if (e instanceof FailsafeException && e.getCause() instanceof InterruptedException cause) {
+        throw cause;
+      }
+      throw e;
+    }
   }
 
-  static HttpRequest buildPropertyValuesRequest(
-      List<String> nodes, String property, String nextToken, DcApiConfig config) {
+  private static void logFailure(
+      HttpRequest request,
+      String requestBody,
+      HttpResponse<String> response,
+      String reason,
+      Exception exception) {
+    String responseBody = response == null ? "" : response.body();
+    logger.error(
+        "DC API call to {} failed: {}; HTTP status={}; request body length={} chars: [{}]; response body length={} chars: [{}]",
+        request.uri(),
+        reason,
+        response == null ? "no response" : response.statusCode(),
+        requestBody.length(),
+        bodyExcerpt(requestBody),
+        responseBody.length(),
+        bodyExcerpt(responseBody),
+        exception);
+  }
+
+  private static String bodyExcerpt(String body) {
+    return body.length() > 500 ? body.substring(0, 500) + "..." : body;
+  }
+
+  private static String buildPropertyValuesBody(
+      List<String> nodes, String property, String nextToken) {
     JsonArray dcids = new JsonArray();
     for (var node : nodes) {
       dcids.add(node);
@@ -109,12 +153,15 @@ public class ApiHelper {
     if (nextToken != null && !nextToken.isEmpty()) {
       arg.addProperty("nextToken", nextToken);
     }
+    return arg.toString();
+  }
 
+  static HttpRequest buildPropertyValuesRequest(String requestBody, DcApiConfig config) {
     var requestBuilder =
         HttpRequest.newBuilder(URI.create(config.apiRoot() + NODE_API_PATH))
             .version(HttpClient.Version.HTTP_1_1)
             .header("accept", "application/json")
-            .POST(HttpRequest.BodyPublishers.ofString(arg.toString()));
+            .POST(HttpRequest.BodyPublishers.ofString(requestBody));
 
     if (!config.apiKey().isEmpty()) {
       requestBuilder.header("x-api-key", config.apiKey());

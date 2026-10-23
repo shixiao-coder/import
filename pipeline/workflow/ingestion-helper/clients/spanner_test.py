@@ -25,114 +25,6 @@ from clients.spanner import SpannerClient, IngestionState, IngestionStage
 class TestSpannerClient(unittest.TestCase):
 
     @patch('google.cloud.spanner.Client')
-    def test_initialize_database_all_exist(self, mock_spanner_client):
-        # Setup mock
-        mock_instance = MagicMock()
-        mock_db = MagicMock()
-        mock_spanner_client.return_value.instance.return_value = mock_instance
-        mock_instance.database.return_value = mock_db
-        
-        # Mock snapshot results (all tables exist)
-        mock_snapshot = MagicMock()
-        mock_db.snapshot.return_value.__enter__.return_value = mock_snapshot
-        mock_snapshot.execute_sql.return_value = [
-            ["table", "Node"],
-            ["table", "Edge"],
-            ["table", "TimeSeries"],
-            ["table", "Observation"],
-            ["table", "NodeEmbedding"],
-            ["table", "ImportStatus"],
-            ["table", "IngestionHistory"],
-            ["table", "ImportVersionHistory"],
-            ["table", "IngestionLock"],
-            ["table", "KeyValueStore"],
-            ["table", "VariableMetadata"],
-            ["index", "NodeEmbeddingIndex"],
-            ["index", "NodeEmbeddingLabelIndex"],
-            ["index", "InEdge"],
-            ["index", "EdgeByProvenance"],
-            ["index", "TimeSeriesByProvenance"],
-            ["index", "TimeSeriesByEntity1"],
-            ["index", "TimeSeriesByEntity2"],
-            ["index", "TimeSeriesByEntity3"],
-            ["index", "KeyValueStoreByProvenance"],
-            ["model", "NodeEmbeddingModel"],
-        ]
-        
-        client = SpannerClient("project", "instance", "database")
-        
-        # Run method
-        client.initialize_database()
-        
-        # Verify update_ddl was NOT called
-        mock_db.update_ddl.assert_not_called()
-
-    @patch('clients.spanner.DatabaseAdminClient')
-    @patch('google.cloud.spanner.Client')
-    def test_initialize_database_none_exist(self, mock_spanner_client,
-                                            mock_admin_client):
-        # Setup mock
-        mock_instance = MagicMock()
-        mock_db = MagicMock()
-        mock_db.name = "projects/test-project/instances/test-instance/databases/test-db"
-        mock_spanner_client.return_value.instance.return_value = mock_instance
-        mock_instance.database.return_value = mock_db
-
-        # Mock DatabaseAdminClient
-        mock_admin_instance = MagicMock()
-        mock_admin_client.return_value = mock_admin_instance
-        mock_operation = MagicMock()
-        mock_admin_instance.update_database_ddl.return_value = mock_operation
-
-        # Mock snapshot results (no tables exist)
-        mock_snapshot = MagicMock()
-        mock_db.snapshot.return_value.__enter__.return_value = mock_snapshot
-        mock_snapshot.execute_sql.return_value = []
-
-        client = SpannerClient("project", "instance", "database")
-
-        def open_side_effect(file_path, mode='r', *args, **kwargs):
-            m = MagicMock()
-            m.__enter__.return_value.read.return_value = 'CREATE TABLE Node; CREATE TABLE NodeEmbedding; {% for model in models %}CREATE MODEL {{ model.name }} REMOTE OPTIONS (endpoint = \'{{ model.endpoint }}\');{% endfor %}'
-            return m
-
-        # Run method with patched open
-        with patch('builtins.open', side_effect=open_side_effect):
-            client.initialize_database()
-
-        # Verify update_database_ddl WAS called
-        mock_admin_instance.update_database_ddl.assert_called_once()
-        mock_operation.result.assert_called_once()
-        
-        # Verify placeholder replacement
-        args, kwargs = mock_admin_instance.update_database_ddl.call_args
-        request = kwargs.get('request') if kwargs else args[0]
-        statements = request.statements
-        self.assertEqual(len(statements), 3)
-        self.assertEqual(statements[0], "CREATE TABLE Node")
-        self.assertEqual(statements[1], "CREATE TABLE NodeEmbedding")
-        self.assertIn("projects/project/locations", statements[2])
-
-    @patch('google.cloud.spanner.Client')
-    def test_initialize_database_inconsistent_state(self, mock_spanner_client):
-        # Setup mock
-        mock_instance = MagicMock()
-        mock_db = MagicMock()
-        mock_spanner_client.return_value.instance.return_value = mock_instance
-        mock_instance.database.return_value = mock_db
-        
-        # Mock snapshot results (some tables exist)
-        mock_snapshot = MagicMock()
-        mock_db.snapshot.return_value.__enter__.return_value = mock_snapshot
-        mock_snapshot.execute_sql.return_value = [["table", "Node"]]
-        
-        client = SpannerClient("project", "instance", "database")
-        
-        # Run method and expect exception
-        with self.assertRaises(RuntimeError):
-            client.initialize_database()
-
-    @patch('google.cloud.spanner.Client')
     def test_acquire_lock_new_row(self, mock_spanner_client):
         # Setup mock
         mock_instance = MagicMock()
@@ -151,7 +43,7 @@ class TestSpannerClient(unittest.TestCase):
         client = SpannerClient("project", "instance", "database")
         
         # Run method
-        result = client.acquire_lock("workflow-123", 3600)
+        result = client.acquire_lock("workflow-123")
         
         # Verify
         self.assertTrue(result)
@@ -178,7 +70,7 @@ class TestSpannerClient(unittest.TestCase):
         client = SpannerClient("project", "instance", "database")
         
         # Run method
-        result = client.acquire_lock("workflow-123", 3600)
+        result = client.acquire_lock("workflow-123")
         
         # Verify
         self.assertTrue(result)
@@ -186,628 +78,92 @@ class TestSpannerClient(unittest.TestCase):
         args, _ = mock_transaction.execute_update.call_args
         self.assertIn("UPDATE IngestionLock", args[0])
 
-    @patch('google.cloud.spanner.Client')
-    def test_seed_database(self, mock_spanner_client):
-        # Setup mock
+    def _lock_client(self, mock_spanner_client, lock_row):
         mock_instance = MagicMock()
         mock_db = MagicMock()
         mock_spanner_client.return_value.instance.return_value = mock_instance
         mock_instance.database.return_value = mock_db
-
         mock_transaction = MagicMock()
-        mock_transaction.execute_sql.return_value = []
-        def run_in_transaction_side_effect(callback, *args, **kwargs):
-            return callback(mock_transaction, *args, **kwargs)
-        mock_db.run_in_transaction.side_effect = run_in_transaction_side_effect
-
-        client = SpannerClient("project", "instance", "database")
-
-        # Run method
-        client.seed_database()
-
-        # Verify
-        mock_transaction.insert.assert_called_once()
-        args, kwargs = mock_transaction.insert.call_args
-        self.assertEqual(kwargs['table'], 'Node')
-        self.assertEqual(kwargs['columns'], ["subject_id", "name", "value", "types", "last_update_timestamp"])
-        self.assertEqual(len(kwargs['values']), 5)
-        expected_subjects = ["StatisticalVariable", "StatVarGroup", "StatVarObservation", "Topic", "dc/g/Root"]
-        expected_names = ["StatisticalVariable", "StatVarGroup", "StatVarObservation", "Topic", "Data Commons Variables"]
-        actual_subjects = [val[0] for val in kwargs['values']]
-        actual_names = [val[1] for val in kwargs['values']]
-        actual_values = [val[2] for val in kwargs['values']]
-        self.assertEqual(actual_subjects, expected_subjects)
-        self.assertEqual(actual_names, expected_names)
-        self.assertEqual(actual_values, expected_subjects)
+        mock_db.run_in_transaction.side_effect = (
+            lambda callback, *args, **kwargs: callback(mock_transaction, *args,
+                                                       **kwargs))
+        mock_transaction.execute_sql.return_value = [lock_row]
+        return SpannerClient("project", "instance",
+                             "database"), mock_transaction
 
     @patch('google.cloud.spanner.Client')
-    def test_seed_database_already_exists(self, mock_spanner_client):
-        # Setup mock
-        mock_instance = MagicMock()
-        mock_db = MagicMock()
-        mock_spanner_client.return_value.instance.return_value = mock_instance
-        mock_instance.database.return_value = mock_db
+    def test_acquire_lock_assigned_to_self(self, mock_spanner_client):
+        from datetime import datetime, timezone
+        client, txn = self._lock_client(
+            mock_spanner_client,
+            ["workflow-123", datetime.now(timezone.utc)])
 
-        mock_transaction = MagicMock()
-        mock_transaction.execute_sql.return_value = [["StatisticalVariable"], ["StatVarGroup"], ["StatVarObservation"], ["Topic"], ["dc/g/Root"]]
-        def run_in_transaction_side_effect(callback, *args, **kwargs):
-            return callback(mock_transaction, *args, **kwargs)
-        mock_db.run_in_transaction.side_effect = run_in_transaction_side_effect
-
-        client = SpannerClient("project", "instance", "database")
-
-        # Run method
-        client.seed_database()
-
-        # Verify
-        mock_transaction.insert.assert_not_called()
-
-    @patch('clients.spanner.DatabaseAdminClient')
-    @patch('google.cloud.spanner.Client')
-    def test_initialize_database_multiple_models(self, mock_spanner_client,
-                                                 mock_admin_client):
-        # Setup mock
-        mock_instance = MagicMock()
-        mock_db = MagicMock()
-        mock_db.name = "projects/test-project/instances/test-instance/databases/test-db"
-        mock_spanner_client.return_value.instance.return_value = mock_instance
-        mock_instance.database.return_value = mock_db
-
-        # Mock DatabaseAdminClient
-        mock_admin_instance = MagicMock()
-        mock_admin_client.return_value = mock_admin_instance
-        mock_operation = MagicMock()
-        mock_admin_instance.update_database_ddl.return_value = mock_operation
-
-        # Mock snapshot results (no tables exist)
-        mock_snapshot = MagicMock()
-        mock_db.snapshot.return_value.__enter__.return_value = mock_snapshot
-        mock_snapshot.execute_sql.return_value = []
-
-        client = SpannerClient("project", "instance", "database", models=[
-            {"name": "NodeEmbeddingModel", "endpoint": "text-embedding-005"},
-            {"name": "NodeEmbeddingModel_multimodalembedding_001", "endpoint": "multimodalembedding-001"}
-        ], embedding_space=512)
-
-        schema_ddl = """
-        CREATE TABLE Node;
-        CREATE TABLE NodeEmbedding (embeddings ARRAY<FLOAT64>(vector_length=>{{ embedding_space }}));
-        {% for model in models %}
-        CREATE MODEL {{ model.name }} REMOTE OPTIONS (endpoint = '{{ model.endpoint }}');
-        {% endfor %}
-        """
-
-        def open_side_effect(file_path, mode='r', *args, **kwargs):
-            m = MagicMock()
-            m.__enter__.return_value.read.return_value = schema_ddl
-            return m
-
-        # Run method with patched open
-        with patch('builtins.open', side_effect=open_side_effect):
-            client.initialize_database()
-
-        # Verify update_database_ddl WAS called
-        mock_admin_instance.update_database_ddl.assert_called_once()
-        mock_operation.result.assert_called_once()
-        
-        # Verify placeholder replacement
-        args, kwargs = mock_admin_instance.update_database_ddl.call_args
-        request = kwargs.get('request') if kwargs else args[0]
-        statements = request.statements
-        self.assertEqual(len(statements), 4)
-        self.assertEqual(statements[0], "CREATE TABLE Node")
-        self.assertEqual(statements[1], "CREATE TABLE NodeEmbedding (embeddings ARRAY<FLOAT64>(vector_length=>512))")
-        self.assertEqual(
-            statements[2],
-            "CREATE MODEL NodeEmbeddingModel REMOTE OPTIONS (endpoint = "
-            "'//aiplatform.googleapis.com/projects/project/locations/"
-            "us-central1/publishers/google/models/text-embedding-005')"
-        )
-        self.assertEqual(
-            statements[3],
-            "CREATE MODEL NodeEmbeddingModel_multimodalembedding_001 REMOTE "
-            "OPTIONS (endpoint = '//aiplatform.googleapis.com/projects/project/"
-            "locations/us-central1/publishers/google/models/multimodalembedding-001')"
-        )
-
-    @patch('clients.spanner.DatabaseAdminClient')
-    @patch('google.cloud.spanner.Client')
-    def test_initialize_database_with_comments(self, mock_spanner_client,
-                                               mock_admin_client):
-        # Setup mock
-        mock_instance = MagicMock()
-        mock_db = MagicMock()
-        mock_db.name = "projects/test-project/instances/test-instance/databases/test-db"
-        mock_spanner_client.return_value.instance.return_value = mock_instance
-        mock_instance.database.return_value = mock_db
-
-        # Mock DatabaseAdminClient
-        mock_admin_instance = MagicMock()
-        mock_admin_client.return_value = mock_admin_instance
-        mock_operation = MagicMock()
-        mock_admin_instance.update_database_ddl.return_value = mock_operation
-
-        client = SpannerClient("project", "instance", "database")
-        client.check_database_initialized = MagicMock(
-            return_value=(
-                [], # Missing tables
-                ["EdgeByProvenance"], # Missing indexes (forces initialization)
-                [] # Missing models
-            )
-        )
-
-        schema_ddl = """
-        -- Comment with semicolon;
-        CREATE TABLE Node;
-        -- Another comment; with semicolon inside
-        CREATE TABLE NodeEmbedding (embeddings ARRAY<FLOAT64>(vector_length=>{{ embedding_space }}));
-        """
-
-        def open_side_effect(file_path, mode='r', *args, **kwargs):
-            m = MagicMock()
-            m.__enter__.return_value.read.return_value = schema_ddl
-            return m
-
-        with patch('builtins.open', side_effect=open_side_effect):
-            client.initialize_database()
-
-        mock_admin_instance.update_database_ddl.assert_called_once()
-        args, kwargs = mock_admin_instance.update_database_ddl.call_args
-        request = kwargs.get('request') if kwargs else args[0]
-        statements = request.statements
-        self.assertEqual(len(statements), 2)
-        self.assertEqual(statements[0], "CREATE TABLE Node")
-        self.assertEqual(statements[1], "CREATE TABLE NodeEmbedding (embeddings ARRAY<FLOAT64>(vector_length=>768))")
-
-    @patch('clients.spanner.DatabaseAdminClient')
-    @patch('google.cloud.spanner.Client')
-    def test_initialize_database_custom_table_and_index(self, mock_spanner_client,
-                                                       mock_admin_client):
-        # Setup mock
-        mock_instance = MagicMock()
-        mock_db = MagicMock()
-        mock_db.name = "projects/test-project/instances/test-instance/databases/test-db"
-        mock_spanner_client.return_value.instance.return_value = mock_instance
-        mock_instance.database.return_value = mock_db
-
-        # Mock DatabaseAdminClient
-        mock_admin_instance = MagicMock()
-        mock_admin_client.return_value = mock_admin_instance
-        mock_operation = MagicMock()
-        mock_admin_instance.update_database_ddl.return_value = mock_operation
-
-        # Mock snapshot results (no tables exist)
-        mock_snapshot = MagicMock()
-        mock_db.snapshot.return_value.__enter__.return_value = mock_snapshot
-        mock_snapshot.execute_sql.return_value = []
-
-        client = SpannerClient(
-            "project", "instance", "database",
-            embedding_table="CustomEmbeddingTable",
-            embedding_index="CustomEmbeddingIndex",
-            embedding_label_index="CustomEmbeddingLabelIndex"
-        )
-
-        schema_ddl = """
-        CREATE TABLE Node;
-        CREATE TABLE {{ embedding_table }} (
-          subject_id STRING(1024) NOT NULL,
-          embeddings ARRAY<FLOAT64>(vector_length=>{{ embedding_space }})
-        ) PRIMARY KEY(subject_id);
-        CREATE VECTOR INDEX {{ embedding_index }} ON {{ embedding_table }}(embeddings);
-        CREATE INDEX {{ embedding_label_index }} ON {{ embedding_table }}(embedding_label);
-        """
-
-        def open_side_effect(file_path, mode='r', *args, **kwargs):
-            m = MagicMock()
-            m.__enter__.return_value.read.return_value = schema_ddl
-            return m
-
-        # Run method with patched open
-        with patch('builtins.open', side_effect=open_side_effect):
-            client.initialize_database()
-
-        # Verify update_database_ddl WAS called
-        mock_admin_instance.update_database_ddl.assert_called_once()
-        mock_operation.result.assert_called_once()
-        
-        # Verify placeholders were replaced correctly
-        args, kwargs = mock_admin_instance.update_database_ddl.call_args
-        request = kwargs.get('request') if kwargs else args[0]
-        statements = request.statements
-        self.assertEqual(len(statements), 4)
-        self.assertEqual(statements[0], "CREATE TABLE Node")
-        self.assertEqual(
-            statements[1].strip(),
-            "CREATE TABLE CustomEmbeddingTable (\n"
-            "          subject_id STRING(1024) NOT NULL,\n"
-            "          embeddings ARRAY<FLOAT64>(vector_length=>768)\n"
-            "        ) PRIMARY KEY(subject_id)"
-        )
-        self.assertEqual(statements[2].strip(), "CREATE VECTOR INDEX CustomEmbeddingIndex ON CustomEmbeddingTable(embeddings)")
-        self.assertEqual(statements[3].strip(), "CREATE INDEX CustomEmbeddingLabelIndex ON CustomEmbeddingTable(embedding_label)")
+        self.assertTrue(client.acquire_lock("workflow-123"))
+        txn.execute_update.assert_called_once()
+        args, kwargs = txn.execute_update.call_args
+        self.assertIn("UPDATE IngestionLock", args[0])
+        self.assertEqual(kwargs["params"]["workflowId"], "workflow-123")
 
     @patch('google.cloud.spanner.Client')
-    def test_update_ingestion_history_pending(self, mock_spanner_client):
-        mock_instance = MagicMock()
-        mock_db = MagicMock()
-        mock_spanner_client.return_value.instance.return_value = mock_instance
-        mock_instance.database.return_value = mock_db
+    def test_acquire_lock_held_by_other(self, mock_spanner_client):
+        from datetime import datetime, timezone
+        client, txn = self._lock_client(
+            mock_spanner_client,
+            ["workflow-other", datetime.now(timezone.utc)])
 
-        mock_transaction = MagicMock()
-        def run_in_transaction_side_effect(callback, *args, **kwargs):
-            return callback(mock_transaction, *args, **kwargs)
-        mock_db.run_in_transaction.side_effect = run_in_transaction_side_effect
-
-        client = SpannerClient("project", "instance", "database")
-        client.update_ingestion_history(
-            workflow_id="wf-123",
-            status=IngestionState.PENDING,
-            stage=IngestionStage.DATAFLOW,
-            ingested_imports=["import1", "import2"]
-        )
-
-        mock_transaction.insert_or_update.assert_called_once()
-        _, kwargs = mock_transaction.insert_or_update.call_args
-        self.assertEqual(kwargs['table'], 'IngestionHistory')
-        self.assertEqual(kwargs['columns'], ["WorkflowExecutionID", "Status", "Stage", "CreationTimestamp", "IngestedImports"])
-        self.assertEqual(kwargs['values'], [["wf-123", "PENDING", "dataflow", spanner.COMMIT_TIMESTAMP, ["import1", "import2"]]])
+        self.assertFalse(client.acquire_lock("workflow-123"))
+        txn.execute_update.assert_not_called()
 
     @patch('google.cloud.spanner.Client')
-    def test_update_ingestion_history_running(self, mock_spanner_client):
-        mock_instance = MagicMock()
-        mock_db = MagicMock()
-        mock_spanner_client.return_value.instance.return_value = mock_instance
-        mock_instance.database.return_value = mock_db
+    def test_acquire_lock_force_takes_over(self, mock_spanner_client):
+        from datetime import datetime, timezone
+        client, txn = self._lock_client(
+            mock_spanner_client,
+            ["workflow-other", datetime.now(timezone.utc)])
 
-        mock_transaction = MagicMock()
-        def run_in_transaction_side_effect(callback, *args, **kwargs):
-            return callback(mock_transaction, *args, **kwargs)
-        mock_db.run_in_transaction.side_effect = run_in_transaction_side_effect
-
-        client = SpannerClient("project", "instance", "database")
-        client.update_ingestion_history(
-            workflow_id="wf-123",
-            status=IngestionState.RUNNING,
-            stage=IngestionStage.DATAFLOW,
-            job_id="job-456"
-        )
-
-        mock_transaction.insert_or_update.assert_called_once()
-        _, kwargs = mock_transaction.insert_or_update.call_args
-        self.assertEqual(kwargs['table'], 'IngestionHistory')
-        self.assertEqual(kwargs['columns'], ["WorkflowExecutionID", "Status", "Stage", "DataflowJobID"])
-        self.assertEqual(kwargs['values'], [["wf-123", "RUNNING", "dataflow", "job-456"]])
+        self.assertTrue(client.acquire_lock("workflow-123", force=True))
+        txn.execute_update.assert_called_once()
+        args, kwargs = txn.execute_update.call_args
+        self.assertIn("UPDATE IngestionLock", args[0])
+        self.assertEqual(kwargs["params"]["workflowId"], "workflow-123")
 
     @patch('google.cloud.spanner.Client')
-    def test_update_ingestion_history_success(self, mock_spanner_client):
-        mock_instance = MagicMock()
-        mock_db = MagicMock()
-        mock_spanner_client.return_value.instance.return_value = mock_instance
-        mock_instance.database.return_value = mock_db
-
-        mock_transaction = MagicMock()
-        def run_in_transaction_side_effect(callback, *args, **kwargs):
-            return callback(mock_transaction, *args, **kwargs)
-        mock_db.run_in_transaction.side_effect = run_in_transaction_side_effect
-
+    def test_get_lock_status_held(self, mock_spanner_client):
         from datetime import datetime, timezone, timedelta
-        creation_time = datetime.now(timezone.utc) - timedelta(seconds=120)
-        mock_transaction.execute_sql.return_value = [[creation_time]]
-
-        client = SpannerClient("project", "instance", "database")
-        client.update_ingestion_history(
-            workflow_id="wf-123",
-            status=IngestionState.SUCCESS,
-            stage=IngestionStage.DATAFLOW,
-            job_id="job-456",
-            metrics={
-                'node_count': 1000,
-                'edge_count': 2000,
-                'obs_count': 500,
-                'ts_count': 300,
-            }
-        )
-
-        mock_transaction.insert_or_update.assert_called_once()
-        _, kwargs = mock_transaction.insert_or_update.call_args
-        self.assertEqual(kwargs['table'], 'IngestionHistory')
-        
-        self.assertIn("WorkflowExecutionID", kwargs['columns'])
-        self.assertIn("Status", kwargs['columns'])
-        self.assertIn("Stage", kwargs['columns'])
-        self.assertIn("CompletionTimestamp", kwargs['columns'])
-        self.assertNotIn("CreationTimestamp", kwargs['columns'])
-        self.assertIn("IngestionFailure", kwargs['columns'])
-        self.assertIn("DataflowJobID", kwargs['columns'])
-        self.assertIn("ExecutionTime", kwargs['columns'])
-        self.assertIn("NodeCount", kwargs['columns'])
-        self.assertIn("TimeSeriesCount", kwargs['columns'])
-        
-        # Verify the specific values
-        wf_idx = kwargs['columns'].index("WorkflowExecutionID")
-        status_idx = kwargs['columns'].index("Status")
-        failure_idx = kwargs['columns'].index("IngestionFailure")
-        job_idx = kwargs['columns'].index("DataflowJobID")
-        exec_idx = kwargs['columns'].index("ExecutionTime")
-        node_idx = kwargs['columns'].index("NodeCount")
-        ts_idx = kwargs['columns'].index("TimeSeriesCount")
-        comp_time_idx = kwargs['columns'].index("CompletionTimestamp")
-        
-        values = kwargs['values'][0]
-        self.assertEqual(values[wf_idx], "wf-123")
-        self.assertEqual(values[status_idx], "SUCCESS")
-        self.assertEqual(values[failure_idx], False)
-        self.assertEqual(values[job_idx], "job-456")
-        self.assertAlmostEqual(values[exec_idx], 120, delta=5)
-        self.assertEqual(values[node_idx], 1000)
-        self.assertEqual(values[ts_idx], 300)
-        self.assertEqual(values[comp_time_idx], spanner.COMMIT_TIMESTAMP)
-
-    @patch('google.cloud.spanner.Client')
-    def test_update_ingestion_history_failure(self, mock_spanner_client):
         mock_instance = MagicMock()
         mock_db = MagicMock()
         mock_spanner_client.return_value.instance.return_value = mock_instance
         mock_instance.database.return_value = mock_db
 
-        mock_transaction = MagicMock()
-        def run_in_transaction_side_effect(callback, *args, **kwargs):
-            return callback(mock_transaction, *args, **kwargs)
-        mock_db.run_in_transaction.side_effect = run_in_transaction_side_effect
+        mock_snapshot = MagicMock()
+        mock_db.snapshot.return_value.__enter__.return_value = mock_snapshot
+        ts = datetime.now(timezone.utc) - timedelta(seconds=120)
+        mock_snapshot.execute_sql.return_value = [["workflow-123", ts]]
 
         client = SpannerClient("project", "instance", "database")
-        client.update_ingestion_history(
-            workflow_id="wf-123",
-            status=IngestionState.FAILURE,
-            stage=IngestionStage.DATAFLOW,
-            job_id="job-456",
-            metrics={
-                'execution_time': 120,
-                'node_count': 1000,
-                'edge_count': 2000,
-                'obs_count': 500,
-                'ts_count': 300,
-            }
-        )
-
-        mock_transaction.insert_or_update.assert_called_once()
-        _, kwargs = mock_transaction.insert_or_update.call_args
-        self.assertEqual(kwargs['table'], 'IngestionHistory')
-
-        self.assertIn("CompletionTimestamp", kwargs['columns'])
-        self.assertNotIn("CreationTimestamp", kwargs['columns'])
-        self.assertIn("IngestionFailure", kwargs['columns'])
-        failure_idx = kwargs['columns'].index("IngestionFailure")
-        comp_time_idx = kwargs['columns'].index("CompletionTimestamp")
-        values = kwargs['values'][0]
-        self.assertEqual(values[failure_idx], True)
-        self.assertEqual(values[comp_time_idx], spanner.COMMIT_TIMESTAMP)
+        result = client.get_lock_status()
+        self.assertTrue(result["locked"])
+        self.assertEqual(result["lockOwner"], "workflow-123")
+        self.assertEqual(result["acquiredTimestamp"], ts.isoformat())
+        self.assertGreaterEqual(result["ageSeconds"], 119.0)
 
     @patch('google.cloud.spanner.Client')
-    def test_update_ingestion_history_no_stage(self, mock_spanner_client):
+    def test_get_lock_status_free(self, mock_spanner_client):
         mock_instance = MagicMock()
         mock_db = MagicMock()
         mock_spanner_client.return_value.instance.return_value = mock_instance
         mock_instance.database.return_value = mock_db
 
-        mock_transaction = MagicMock()
-        def run_in_transaction_side_effect(callback, *args, **kwargs):
-            return callback(mock_transaction, *args, **kwargs)
-        mock_db.run_in_transaction.side_effect = run_in_transaction_side_effect
+        mock_snapshot = MagicMock()
+        mock_db.snapshot.return_value.__enter__.return_value = mock_snapshot
+        mock_snapshot.execute_sql.return_value = [[None, None]]
 
         client = SpannerClient("project", "instance", "database")
-        client.update_ingestion_history(
-            workflow_id="wf-123",
-            status=IngestionState.RUNNING,
-            job_id="job-456"
-        )
-
-        mock_transaction.insert_or_update.assert_called_once()
-        _, kwargs = mock_transaction.insert_or_update.call_args
-        self.assertEqual(kwargs['table'], 'IngestionHistory')
-        self.assertNotIn("Stage", kwargs['columns'])
-        self.assertEqual(kwargs['columns'], ["WorkflowExecutionID", "Status", "DataflowJobID"])
-        self.assertEqual(kwargs['values'], [["wf-123", "RUNNING", "job-456"]])
-
-    @patch('google.cloud.spanner.Client')
-    def test_update_ingestion_history_retry(self, mock_spanner_client):
-        mock_instance = MagicMock()
-        mock_db = MagicMock()
-        mock_spanner_client.return_value.instance.return_value = mock_instance
-        mock_instance.database.return_value = mock_db
-
-        mock_transaction = MagicMock()
-        def run_in_transaction_side_effect(callback, *args, **kwargs):
-            return callback(mock_transaction, *args, **kwargs)
-        mock_db.run_in_transaction.side_effect = run_in_transaction_side_effect
-
-        client = SpannerClient("project", "instance", "database")
-        client.update_ingestion_history(
-            workflow_id="wf-123",
-            status=IngestionState.RETRY,
-            stage=IngestionStage.DATAFLOW,
-            job_id="job-456",
-            metrics={
-                'execution_time': 120,
-                'node_count': 1000,
-                'edge_count': 2000,
-                'obs_count': 500,
-                'ts_count': 300,
-            }
-        )
-
-        mock_transaction.insert_or_update.assert_called_once()
-        _, kwargs = mock_transaction.insert_or_update.call_args
-        self.assertEqual(kwargs['table'], 'IngestionHistory')
-
-        self.assertIn("CompletionTimestamp", kwargs['columns'])
-        self.assertNotIn("CreationTimestamp", kwargs['columns'])
-        self.assertIn("IngestionFailure", kwargs['columns'])
-        failure_idx = kwargs['columns'].index("IngestionFailure")
-        comp_time_idx = kwargs['columns'].index("CompletionTimestamp")
-        values = kwargs['values'][0]
-        self.assertEqual(values[failure_idx], True)
-        self.assertEqual(values[comp_time_idx], spanner.COMMIT_TIMESTAMP)
-
-    @patch('google.cloud.spanner.Client')
-    def test_update_import_version_history(self, mock_spanner_client):
-        mock_instance = MagicMock()
-        mock_db = MagicMock()
-        mock_spanner_client.return_value.instance.return_value = mock_instance
-        mock_instance.database.return_value = mock_db
-
-        mock_transaction = MagicMock()
-        def run_in_transaction_side_effect(callback, *args, **kwargs):
-            return callback(mock_transaction, *args, **kwargs)
-        mock_db.run_in_transaction.side_effect = run_in_transaction_side_effect
-
-        client = SpannerClient("project", "instance", "database")
-        import_list = [{"importName": "test_import", "latestVersion": "v1.2.3"}]
-        client.update_import_version_history(import_list, workflow_id="wf-123")
-
-        mock_transaction.insert.assert_called_once()
-        _, kwargs = mock_transaction.insert.call_args
-        self.assertEqual(kwargs['table'], 'ImportVersionHistory')
-        self.assertEqual(kwargs['columns'], [
-            "ImportName", "Version", "UpdateTimestamp",
-            "WorkflowExecutionID", "Status", "ExecutionTime", "NodeCount",
-            "EdgeCount", "ObservationCount", "TimeSeriesCount", "Comment"
-        ])
-        self.assertEqual(kwargs['values'], [[
-            "test_import", "v1.2.3", spanner.COMMIT_TIMESTAMP, "wf-123",
-            None, None, None, None, None, None, "ingestion-workflow:wf-123"
-        ]])
-
-    @patch('google.cloud.spanner.Client')
-    def test_update_version_history(self, mock_spanner_client):
-        mock_instance = MagicMock()
-        mock_db = MagicMock()
-        mock_spanner_client.return_value.instance.return_value = mock_instance
-        mock_instance.database.return_value = mock_db
-
-        mock_transaction = MagicMock()
-        def run_in_transaction_side_effect(callback, *args, **kwargs):
-            return callback(mock_transaction, *args, **kwargs)
-        mock_db.run_in_transaction.side_effect = run_in_transaction_side_effect
-
-        client = SpannerClient("project", "instance", "database")
-        client.update_version_history("test_import", "v1.2.3", "ingestion-workflow:wf-789", workflow_id="wf-789")
-
-        mock_transaction.insert.assert_called_once()
-        _, kwargs = mock_transaction.insert.call_args
-        self.assertEqual(kwargs['table'], 'ImportVersionHistory')
-        self.assertEqual(kwargs['columns'], [
-            "ImportName", "Version", "UpdateTimestamp",
-            "WorkflowExecutionID", "Status", "ExecutionTime", "NodeCount",
-            "EdgeCount", "ObservationCount", "TimeSeriesCount", "Comment"
-        ])
-        self.assertEqual(kwargs['values'], [[
-            "test_import", "v1.2.3", spanner.COMMIT_TIMESTAMP, "wf-789",
-            None, None, None, None, None, None, "ingestion-workflow:wf-789"
-        ]])
-
-    @patch('google.cloud.spanner.Client')
-    def test_update_import_version_history_per_import_counts(self, mock_spanner_client):
-        mock_instance = MagicMock()
-        mock_db = MagicMock()
-        mock_spanner_client.return_value.instance.return_value = mock_instance
-        mock_instance.database.return_value = mock_db
-
-        mock_transaction = MagicMock()
-        def run_in_transaction_side_effect(callback, *args, **kwargs):
-            return callback(mock_transaction, *args, **kwargs)
-        mock_db.run_in_transaction.side_effect = run_in_transaction_side_effect
-
-        client = SpannerClient("project", "instance", "database")
-
-        import_list = [
-            {"importName": "import1", "latestVersion": "v1.0"},
-            {"importName": "import2", "latestVersion": "v2.0"}
-        ]
-        metrics = {
-            'execution_time': 120,
-            'import_metrics': {
-                "import1": {'node_count': 10, 'edge_count': 20, 'ts_count': 5, 'obs_count': 15},
-                "import2": {'node_count': 30, 'edge_count': 40, 'ts_count': 25, 'obs_count': 35},
-            }
-        }
-        client.update_import_version_history(
-            import_list, workflow_id="wf-123", status="SUCCESS", metrics=metrics
-        )
-
-        mock_transaction.insert.assert_called_once()
-        _, kwargs = mock_transaction.insert.call_args
-        self.assertEqual(kwargs['table'], 'ImportVersionHistory')
-        self.assertEqual(kwargs['values'], [
-            ["import1", "v1.0", spanner.COMMIT_TIMESTAMP, "wf-123", "SUCCESS", 120, 10, 20, 15, 5, "ingestion-workflow:wf-123"],
-            ["import2", "v2.0", spanner.COMMIT_TIMESTAMP, "wf-123", "SUCCESS", 120, 30, 40, 35, 25, "ingestion-workflow:wf-123"]
-        ])
-
-
-    @patch('google.cloud.spanner.Client')
-    def test_get_import_version_history(self, mock_spanner_client):
-        mock_instance = MagicMock()
-        mock_db = MagicMock()
-        mock_spanner_client.return_value.instance.return_value = mock_instance
-        mock_instance.database.return_value = mock_db
-
-        mock_txn = MagicMock()
-        def run_in_transaction_side_effect(callback, *args, **kwargs):
-            return callback(mock_txn, *args, **kwargs)
-        mock_db.run_in_transaction.side_effect = run_in_transaction_side_effect
-
-        mock_results = MagicMock()
-        mock_results.__iter__.return_value = [["v2"], ["v1"]]
-        mock_txn.execute_sql.return_value = mock_results
-
-        client = SpannerClient("project", "instance", "database")
-        history = client.get_import_version_history("foo:bar:imp1", limit=5)
-        self.assertEqual(history, ["v2", "v1"])
-
-    @patch('google.cloud.spanner.Client')
-    def test_get_import_version_history_with_status(self, mock_spanner_client):
-        mock_instance = MagicMock()
-        mock_db = MagicMock()
-        mock_spanner_client.return_value.instance.return_value = mock_instance
-        mock_instance.database.return_value = mock_db
-
-        mock_txn = MagicMock()
-        def run_in_transaction_side_effect(callback, *args, **kwargs):
-            return callback(mock_txn, *args, **kwargs)
-        mock_db.run_in_transaction.side_effect = run_in_transaction_side_effect
-
-        mock_results = MagicMock()
-        mock_results.__iter__.return_value = [["v1"]]
-        mock_txn.execute_sql.return_value = mock_results
-
-        client = SpannerClient("project", "instance", "database")
-        history = client.get_import_version_history("foo:bar:imp1", limit=5, status="SUCCESS")
-        self.assertEqual(history, ["v1"])
-        call_args = mock_txn.execute_sql.call_args
-        self.assertIn("Status = @status", call_args[0][0])
-        self.assertEqual(call_args[1]["params"]["status"], "SUCCESS")
-
-    @patch('google.cloud.spanner.Client')
-    def test_get_import_latest_version(self, mock_spanner_client):
-        mock_instance = MagicMock()
-        mock_db = MagicMock()
-        mock_spanner_client.return_value.instance.return_value = mock_instance
-        mock_instance.database.return_value = mock_db
-
-        mock_txn = MagicMock()
-        def run_in_transaction_side_effect(callback, *args, **kwargs):
-            return callback(mock_txn, *args, **kwargs)
-        mock_db.run_in_transaction.side_effect = run_in_transaction_side_effect
-
-        mock_results = MagicMock()
-        mock_results.__iter__.return_value = [["gs://bucket/path/v2"]]
-        mock_txn.execute_sql.return_value = mock_results
-
-        client = SpannerClient("project", "instance", "database")
-        latest = client.get_import_latest_version("foo:bar:imp1")
-        self.assertEqual(latest, "gs://bucket/path/v2")
-
+        result = client.get_lock_status()
+        self.assertFalse(result["locked"])
+        self.assertIsNone(result["lockOwner"])
+        self.assertIsNone(result["acquiredTimestamp"])
+        self.assertIsNone(result["ageSeconds"])
     @patch('google.cloud.spanner.Client')
     def test_revert_import_state(self, mock_spanner_client):
         mock_instance = MagicMock()
@@ -855,6 +211,10 @@ class TestSpannerClient(unittest.TestCase):
         mock_spanner_client.return_value.instance.return_value = mock_instance
         mock_instance.database.return_value = mock_db
 
+        mock_snapshot = MagicMock()
+        mock_db.snapshot.return_value.__enter__.return_value = mock_snapshot
+        mock_snapshot.execute_sql.return_value = []
+
         client = SpannerClient("project", "instance", "database")
         import_list = [{
             "importName": "EurostatData",
@@ -865,32 +225,16 @@ class TestSpannerClient(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["importName"], "EurostatData")
         self.assertEqual(result[0]["latestVersion"], "gs://datcom-prod-imports/scripts/eurostat/2026_08_03T19_03_05_074661_07_00/*/*.mcf")
-        mock_db.snapshot.assert_not_called()
 
-    @patch('google.cloud.spanner.Client')
-    def test_get_import_info_with_dict_import_name_only(self, mock_spanner_client):
-        mock_instance = MagicMock()
-        mock_db = MagicMock()
-        mock_spanner_client.return_value.instance.return_value = mock_instance
-        mock_instance.database.return_value = mock_db
-
-        mock_snapshot = MagicMock()
-        mock_db.snapshot.return_value.__enter__.return_value = mock_snapshot
-        mock_results = [
-            ["EurostatData", "gs://bucket/version1", "/*/*.mcf"]
-        ]
-        mock_snapshot.execute_sql.return_value = mock_results
-
-        client = SpannerClient("project", "instance", "database")
-        result = client.get_import_info([{"importName": "EurostatData"}])
-
-        self.assertEqual(len(result), 1)
-        self.assertEqual(result[0]["importName"], "EurostatData")
-        self.assertEqual(result[0]["latestVersion"], "gs://bucket/version1/*/*.mcf")
-        mock_snapshot.execute_sql.assert_called_once()
 
     @patch('google.cloud.spanner.Client')
     def test_get_import_info_empty_list(self, mock_spanner_client):
+        client = SpannerClient("project", "instance", "database")
+        self.assertEqual(client.get_import_info([]), [])
+        self.assertEqual(client.get_import_info(None), [])
+
+    @patch('google.cloud.spanner.Client')
+    def test_get_import_info_skips_when_already_success(self, mock_spanner_client):
         mock_instance = MagicMock()
         mock_db = MagicMock()
         mock_spanner_client.return_value.instance.return_value = mock_instance
@@ -898,18 +242,126 @@ class TestSpannerClient(unittest.TestCase):
 
         mock_snapshot = MagicMock()
         mock_db.snapshot.return_value.__enter__.return_value = mock_snapshot
-        mock_results = [
-            ["ImportA", "gs://bucket/v1", "/*/*.mcf"]
+        mock_snapshot.execute_sql.return_value = [
+            ["EurostatData", "gs://bucket/v1"]
         ]
-        mock_snapshot.execute_sql.return_value = mock_results
 
         client = SpannerClient("project", "instance", "database")
-        result = client.get_import_info([])
+        import_list = [{
+            "importName": "EurostatData",
+            "latestVersion": "gs://bucket/v1"
+        }]
 
+        result = client.get_import_info(import_list)
+        self.assertEqual(len(result), 0)
+
+    @patch('google.cloud.spanner.Client')
+    def test_get_import_info_does_not_skip_when_not_in_success_imports(self, mock_spanner_client):
+        mock_instance = MagicMock()
+        mock_db = MagicMock()
+        mock_spanner_client.return_value.instance.return_value = mock_instance
+        mock_instance.database.return_value = mock_db
+
+        mock_snapshot = MagicMock()
+        mock_db.snapshot.return_value.__enter__.return_value = mock_snapshot
+        mock_snapshot.execute_sql.return_value = []
+
+        client = SpannerClient("project", "instance", "database")
+        import_list = [{
+            "importName": "NewImport",
+            "latestVersion": "gs://bucket/v1"
+        }]
+
+        result = client.get_import_info(import_list)
         self.assertEqual(len(result), 1)
-        self.assertEqual(result[0]["importName"], "ImportA")
-        self.assertEqual(result[0]["latestVersion"], "gs://bucket/v1/*/*.mcf")
-        mock_snapshot.execute_sql.assert_called_once()
+        self.assertEqual(result[0]["importName"], "NewImport")
+
+    @patch('google.cloud.spanner.Client')
+    def test_get_import_info_filters_successful_versions(self, mock_spanner_client):
+        mock_instance = MagicMock()
+        mock_db = MagicMock()
+        mock_spanner_client.return_value.instance.return_value = mock_instance
+        mock_instance.database.return_value = mock_db
+
+        mock_snapshot = MagicMock()
+        mock_db.snapshot.return_value.__enter__.return_value = mock_snapshot
+        # Database returns SUCCESS for ImportAlreadyIngested (v1), ImportWithNewVersion (v1), ImportForced (v1)
+        mock_snapshot.execute_sql.return_value = [
+            ["ImportAlreadyIngested", "gs://bucket/v1"],
+            ["ImportWithNewVersion", "gs://bucket/v1"],
+            ["ImportForced", "gs://bucket/v1"],
+        ]
+
+        client = SpannerClient("project", "instance", "database")
+        import_list = [
+            # 1. Already ingested with same version -> should be filtered out / skipped
+            {
+                "importName": "ImportAlreadyIngested",
+                "latestVersion": "gs://bucket/v1",
+            },
+            # 2. Ingested with v1, but requested with v2 -> should NOT be skipped
+            {
+                "importName": "ImportWithNewVersion",
+                "latestVersion": "gs://bucket/v2",
+            },
+            # 3. Brand new import not in ImportStatus -> should NOT be skipped
+            {
+                "importName": "ImportBrandNew",
+                "latestVersion": "gs://bucket/v1",
+            },
+        ]
+
+        result = client.get_import_info(import_list)
+        result_names = [item["importName"] for item in result]
+
+        self.assertEqual(len(result), 2)
+        self.assertNotIn("ImportAlreadyIngested", result_names)
+        self.assertIn("ImportWithNewVersion", result_names)
+        self.assertIn("ImportBrandNew", result_names)
+
+        # When force_ingestion=True, nothing is filtered out
+        result_forced = client.get_import_info(import_list, force_ingestion=True)
+        self.assertEqual(len(result_forced), 3)
+
+    @patch('google.cloud.spanner.Client')
+    def test_get_import_version_record_found(self, mock_spanner_client):
+        from datetime import datetime, timezone
+        mock_instance = MagicMock()
+        mock_db = MagicMock()
+        mock_spanner_client.return_value.instance.return_value = mock_instance
+        mock_instance.database.return_value = mock_db
+
+        mock_snapshot = MagicMock()
+        mock_db.snapshot.return_value.__enter__.return_value = mock_snapshot
+        ts = datetime(2026, 10, 8, 10, 0, 0, tzinfo=timezone.utc)
+        mock_snapshot.execute_sql.return_value = [
+            ["gs://bucket/path/v1/*/*.mcf", "wf-123", ts]
+        ]
+
+        client = SpannerClient("project", "instance", "database")
+        record = client.get_import_version_record("scripts/foo:imp1")
+        self.assertEqual(
+            record,
+            {
+                "version": "gs://bucket/path/v1/*/*.mcf",
+                "workflowId": "wf-123",
+                "updateTimestamp": ts.isoformat(),
+            },
+        )
+
+    @patch('google.cloud.spanner.Client')
+    def test_get_import_version_record_not_found(self, mock_spanner_client):
+        mock_instance = MagicMock()
+        mock_db = MagicMock()
+        mock_spanner_client.return_value.instance.return_value = mock_instance
+        mock_instance.database.return_value = mock_db
+
+        mock_snapshot = MagicMock()
+        mock_db.snapshot.return_value.__enter__.return_value = mock_snapshot
+        mock_snapshot.execute_sql.return_value = []
+
+        client = SpannerClient("project", "instance", "database")
+        self.assertIsNone(client.get_import_version_record("imp1"))
 
 
 if __name__ == '__main__':

@@ -12,10 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-End-to-end test for import automation and Spanner ingestion workflows.
+End-to-end test for Spanner ingestion workflow.
 """
 
-import json
 import os
 import sys
 
@@ -41,13 +40,15 @@ else:
                                          'datcom-spanner-test')
     SPANNER_DATABASE_ID = os.environ.get('SPANNER_DATABASE_ID', 'dc-test-db')
 GCS_BUCKET_ID = os.environ.get('GCS_BUCKET_ID', 'datcom-ci-test')
-IMPORT_WORKFLOW_ID = os.environ.get('IMPORT_WORKFLOW_ID',
-                                    'import-automation-workflow-staging')
 INGESTION_WORKFLOW_ID = os.environ.get('INGESTION_WORKFLOW_ID',
                                        'spanner-ingestion-workflow-staging')
 
 # Test Import Configuration
 TEST_IMPORT_NAME = 'scripts/us_fed/treasury_constant_maturity_rates:USFed_ConstantMaturityRates_Test'
+TEST_IMPORT_VERSION = os.environ.get(
+    'TEST_IMPORT_VERSION',
+    f"gs://{GCS_BUCKET_ID}/scripts/us_fed/treasury_constant_maturity_rates/{TEST_IMPORT_NAME.split(':')[-1]}/test_version/*/*/*.mcf",
+)
 
 
 def verify_spanner_data(import_name):
@@ -147,24 +148,20 @@ def main(argv):
         short_import_name = TEST_IMPORT_NAME.split(':')[-1]
         cleanup_spanner(short_import_name)
 
-        # 1. Trigger Import Automation Workflow (which automatically invokes Spanner Ingestion Workflow)
-        job_name = "test-import"
-        import_config = {
-            "gcp_project_id": PROJECT_ID,
-            "gcs_project_id": PROJECT_ID,
-            "storage_prod_bucket_name": GCS_BUCKET_ID,
-            "gcs_bucket_volume_mount": GCS_BUCKET_ID
+        # 1. Trigger Spanner Ingestion Workflow
+        ingestion_workflow_args = {
+            "importList": [
+                {
+                    "importName": short_import_name,
+                    "latestVersion": TEST_IMPORT_VERSION,
+                }
+            ]
         }
 
-        import_workflow_args = {
-            "importName": TEST_IMPORT_NAME,
-            "importConfig": json.dumps(import_config),
-        }
-
-        logging.info("Step 1: Running Import Automation Workflow...")
+        logging.info("Step 1: Running Spanner Ingestion Workflow...")
         cloud_workflow.trigger_workflow_and_wait(PROJECT_ID, LOCATION,
-                                                 IMPORT_WORKFLOW_ID,
-                                                 import_workflow_args)
+                                                 INGESTION_WORKFLOW_ID,
+                                                 ingestion_workflow_args)
 
         # 2. Verify Data in Spanner
         logging.info("Step 2: Verifying Data in Spanner...")
