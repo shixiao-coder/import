@@ -505,6 +505,146 @@ public class GraphReader implements Serializable {
     return Observation.builder().seriesKey(seriesKey).date(obs.getDate()).value(value).build();
   }
 
+  public static List<KV<Node, List<Edge>>> graphToNodesAndEdges(
+      McfGraph graph, String provenance, Counter mcfNodesWithoutTypeCounter) {
+    List<KV<Node, List<Edge>>> nodesAndEdges = new ArrayList<>();
+    for (Map.Entry<String, PropertyValues> nodeEntry : graph.getNodesMap().entrySet()) {
+      PropertyValues pvs = nodeEntry.getValue();
+      if (!GraphUtils.isObservation(pvs)) {
+        Map<String, McfGraph.Values> pv = pvs.getPvsMap();
+        String dcid = GraphUtils.getPropVal(pvs, GraphUtils.Property.dcid.name());
+        String subjectId = !dcid.isEmpty() ? dcid : McfUtil.stripNamespace(nodeEntry.getKey());
+
+        List<String> types = GraphUtils.getPropertyValues(pv, "typeOf");
+        if (types.isEmpty()) {
+          types = List.of(PipelineUtils.TYPE_THING);
+          LOGGER.info("Found MCF node with no type: {}", nodeEntry.getKey());
+          mcfNodesWithoutTypeCounter.inc();
+        }
+        String name = GraphUtils.getPropVal(pvs, GraphUtils.Property.name.name());
+        Node subjectNode =
+            Node.builder()
+                .subjectId(subjectId)
+                .value(subjectId)
+                .name(!name.isEmpty() ? name : subjectId)
+                .types(types)
+                .build();
+
+        List<Edge> subjectEdges = new ArrayList<>();
+        List<Node> leafNodes = new ArrayList<>();
+        for (Map.Entry<String, McfGraph.Values> entry : pv.entrySet()) {
+          if (entry.getKey().equals("dcid")) {
+            continue;
+          }
+          for (TypedValue val : entry.getValue().getTypedValuesList()) {
+            String objectId;
+            if (val.getType() == ValueType.RESOLVED_REF) {
+              objectId = McfUtil.stripNamespace(val.getValue());
+            } else {
+              boolean storeAsBytes = PipelineUtils.storeValueAsBytes(entry.getKey());
+              byte[] compressedBytes =
+                  storeAsBytes ? PipelineUtils.compressString(val.getValue()) : null;
+              int valSize = storeAsBytes ? compressedBytes.length : val.getValue().length();
+              int maxSize =
+                  storeAsBytes
+                      ? SpannerClient.MAX_SPANNER_COLUMN_SIZE
+                      : SpannerClient.MAX_SPANNER_STRING_COLUMN_SIZE;
+              if (valSize > maxSize) {
+                LOGGER.warn(
+                    "Dropping node and edge from {} because value size {} exceeds max size.",
+                    subjectId,
+                    valSize);
+                continue;
+              }
+              objectId = PipelineUtils.generateObjectValueKey(val.getValue());
+              Node.Builder leafNode = Node.builder().subjectId(objectId);
+              if (storeAsBytes) {
+                leafNode.bytes(ByteArray.copyFrom(compressedBytes));
+              } else {
+                leafNode.value(val.getValue());
+              }
+              leafNodes.add(leafNode.build());
+            }
+            Edge edge =
+                Edge.builder()
+                    .subjectId(subjectId)
+                    .predicate(entry.getKey())
+                    .provenance(provenance)
+                    .objectId(objectId)
+                    .build();
+            subjectEdges.add(edge);
+          }
+        }
+
+        nodesAndEdges.add(KV.of(subjectNode, subjectEdges));
+        for (Node leafNode : leafNodes) {
+          nodesAndEdges.add(KV.of(leafNode, Collections.emptyList()));
+        }
+      }
+    }
+    return nodesAndEdges;
+  }
+
+  public static PCollection<KV<Node, List<Edge>>> graphToNodesAndEdges(
+      String importName,
+      PCollection<McfGraph> graph,
+      String provenance,
+      Counter mcfNodesWithoutTypeCounter) {
+    return graph.apply(
+        "GraphToNodesAndEdges-" + importName,
+        ParDo.of(
+            new DoFn<McfGraph, KV<Node, List<Edge>>>() {
+              @ProcessElement
+              public void processElement(
+                  @Element McfGraph element, OutputReceiver<KV<Node, List<Edge>>> receiver) {
+                List<KV<Node, List<Edge>>> nodesAndEdges =
+                    graphToNodesAndEdges(element, provenance, mcfNodesWithoutTypeCounter);
+                nodesAndEdges.forEach(receiver::output);
+              }
+            }));
+  }
+
+  public static PCollection<Mutation> nodesToMutations(
+      String importName,
+      PCollection<KV<Node, List<Edge>>> nodesAndEdges,
+      SpannerClient spannerClient,
+      Counter nodeCounter) {
+    return nodesAndEdges.apply(
+        "ExtractNodeMutations-" + importName,
+        ParDo.of(
+            new DoFn<KV<Node, List<Edge>>, Mutation>() {
+              @ProcessElement
+              public void processElement(
+                  @Element KV<Node, List<Edge>> element, OutputReceiver<Mutation> receiver) {
+                receiver.output(spannerClient.toNodeMutation(element.getKey()));
+                nodeCounter.inc();
+              }
+            }));
+  }
+
+  public static PCollection<Mutation> edgesToMutations(
+      String importName,
+      PCollection<KV<Node, List<Edge>>> nodesAndEdges,
+      SpannerClient spannerClient,
+      Counter edgeCounter) {
+    return nodesAndEdges.apply(
+        "ExtractEdgeMutations-" + importName,
+        ParDo.of(
+            new DoFn<KV<Node, List<Edge>>, Mutation>() {
+              @ProcessElement
+              public void processElement(
+                  @Element KV<Node, List<Edge>> element, OutputReceiver<Mutation> receiver) {
+                List<Edge> edges = element.getValue();
+                if (edges != null && !edges.isEmpty()) {
+                  for (Edge edge : edges) {
+                    receiver.output(spannerClient.toEdgeMutation(edge));
+                  }
+                  edgeCounter.inc(edges.size());
+                }
+              }
+            }));
+  }
+
   public static PCollection<KV<String, Mutation>> graphToNodes(
       String importName,
       PCollection<McfGraph> graph,

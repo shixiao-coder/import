@@ -4,16 +4,26 @@ import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 
 import com.google.cloud.ByteArray;
+import com.google.cloud.spanner.Mutation;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
 import org.apache.beam.sdk.metrics.Counter;
+import org.apache.beam.sdk.metrics.Metrics;
+import org.apache.beam.sdk.testing.PAssert;
+import org.apache.beam.sdk.testing.TestPipeline;
+import org.apache.beam.sdk.transforms.Create;
 import org.apache.beam.sdk.transforms.DoFn;
+import org.apache.beam.sdk.values.KV;
+import org.apache.beam.sdk.values.PCollection;
 import org.datacommons.ingestion.data.Edge;
 import org.datacommons.ingestion.data.Node;
 import org.datacommons.ingestion.data.Observation;
 import org.datacommons.ingestion.data.TimeSeries;
 import org.datacommons.ingestion.data.TimeSeriesKey;
+import org.datacommons.ingestion.spanner.SpannerClient;
 import org.datacommons.proto.Mcf.McfGraph;
 import org.datacommons.proto.Mcf.McfGraph.PropertyValues;
 import org.datacommons.proto.Mcf.McfGraph.TypedValue;
@@ -21,10 +31,13 @@ import org.datacommons.proto.Mcf.McfStatVarObsSeries;
 import org.datacommons.proto.Mcf.McfStatVarObsSeries.StatVarObs;
 import org.datacommons.proto.Mcf.McfType;
 import org.datacommons.proto.Mcf.ValueType;
+import org.junit.Rule;
 import org.junit.Test;
 import org.mockito.Mockito;
 
 public class GraphReaderTest {
+
+  @Rule public final transient TestPipeline pipeline = TestPipeline.create();
 
   @Test
   public void testGraphToNodes() {
@@ -672,5 +685,226 @@ public class GraphReaderTest {
 
     // Should only output 1 TimeSeries since obs1 and obs2 belong to the same TimeSeries
     Mockito.verify(mockContext, Mockito.times(1)).output(Mockito.any(TimeSeries.class));
+  }
+
+  @Test
+  public void testGraphToNodesAndEdges() {
+    Counter mockMcfNodesWithoutTypeCounter = Mockito.mock(Counter.class);
+    String geoJson =
+        "{   \"type\": \"Polygon\",   \"coordinates\": [     [       [9, 7],       [9, 6.5],      "
+            + " [9.5, 6.5],       [9.5, 7],       [9, 7]     ]   ] } ";
+    McfGraph graph =
+        McfGraph.newBuilder()
+            .setType(McfType.INSTANCE_MCF)
+            .putNodes(
+                "dcid0",
+                PropertyValues.newBuilder()
+                    .putPvs(
+                        "name",
+                        McfGraph.Values.newBuilder()
+                            .addTypedValues(
+                                TypedValue.newBuilder()
+                                    .setType(ValueType.TEXT)
+                                    .setValue("Node Zero"))
+                            .build())
+                    .putPvs(
+                        "dcid",
+                        McfGraph.Values.newBuilder()
+                            .addTypedValues(
+                                TypedValue.newBuilder().setType(ValueType.TEXT).setValue("dcid0"))
+                            .build())
+                    .putPvs(
+                        "typeOf",
+                        McfGraph.Values.newBuilder()
+                            .addTypedValues(
+                                TypedValue.newBuilder()
+                                    .setType(ValueType.RESOLVED_REF)
+                                    .setValue("Class"))
+                            .build())
+                    .putPvs(
+                        "geoJsonCoordinates",
+                        McfGraph.Values.newBuilder()
+                            .addTypedValues(
+                                TypedValue.newBuilder().setType(ValueType.TEXT).setValue(geoJson))
+                            .build())
+                    .build())
+            .putNodes(
+                "dcid_obs", // Should be skipped as observation
+                PropertyValues.newBuilder()
+                    .putPvs(
+                        "typeOf",
+                        McfGraph.Values.newBuilder()
+                            .addTypedValues(
+                                TypedValue.newBuilder()
+                                    .setType(ValueType.RESOLVED_REF)
+                                    .setValue("StatVarObservation"))
+                            .build())
+                    .build())
+            .putNodes(
+                "dcid2", // Node with no name or types
+                PropertyValues.newBuilder().build())
+            .build();
+
+    List<KV<Node, List<Edge>>> actual =
+        GraphReader.graphToNodesAndEdges(graph, "dc/base/Test", mockMcfNodesWithoutTypeCounter);
+
+    Node expectedDcid0 =
+        Node.builder()
+            .subjectId("dcid0")
+            .value("dcid0")
+            .name("Node Zero")
+            .types(List.of("Class"))
+            .build();
+    List<Edge> expectedDcid0Edges =
+        new ArrayList<>(
+            Arrays.asList(
+                Edge.builder()
+                    .subjectId("dcid0")
+                    .predicate("name")
+                    .objectId("Node Zero:kUyRupzrJkxe/HIOIctxlJX4woEGeOTtlVwqyXYnfDE=")
+                    .provenance("dc/base/Test")
+                    .build(),
+                Edge.builder()
+                    .subjectId("dcid0")
+                    .predicate("typeOf")
+                    .objectId("Class")
+                    .provenance("dc/base/Test")
+                    .build(),
+                Edge.builder()
+                    .subjectId("dcid0")
+                    .predicate("geoJsonCoordinates")
+                    .objectId("{   \"type\": \"Pol:EvbccRWWGibzhA4ntdF1bboIUsn4ThUiAZe3TV4hmB8=")
+                    .provenance("dc/base/Test")
+                    .build()));
+    Node expectedDcid2 =
+        Node.builder()
+            .subjectId("dcid2")
+            .value("dcid2")
+            .name("dcid2")
+            .types(List.of("Thing"))
+            .build();
+    Node expectedNameLeaf =
+        Node.builder()
+            .subjectId("Node Zero:kUyRupzrJkxe/HIOIctxlJX4woEGeOTtlVwqyXYnfDE=")
+            .value("Node Zero")
+            .build();
+    Node expectedGeoLeaf =
+        Node.builder()
+            .subjectId("{   \"type\": \"Pol:EvbccRWWGibzhA4ntdF1bboIUsn4ThUiAZe3TV4hmB8=")
+            .bytes(ByteArray.copyFrom(PipelineUtils.compressString(geoJson)))
+            .build();
+
+    List<KV<Node, List<Edge>>> expected =
+        Arrays.asList(
+            KV.of(expectedDcid0, expectedDcid0Edges),
+            KV.of(expectedDcid2, Collections.emptyList()),
+            KV.of(expectedNameLeaf, Collections.emptyList()),
+            KV.of(expectedGeoLeaf, Collections.emptyList()));
+
+    Comparator<KV<Node, List<Edge>>> kvComparator =
+        Comparator.comparing(kv -> kv.getKey().getSubjectId());
+    Comparator<Edge> edgeComparator =
+        Comparator.comparing(Edge::getSubjectId)
+            .thenComparing(Edge::getPredicate)
+            .thenComparing(Edge::getObjectId);
+
+    actual.sort(kvComparator);
+    expected.sort(kvComparator);
+
+    assertEquals(expected.size(), actual.size());
+    for (int i = 0; i < expected.size(); i++) {
+      assertEquals(expected.get(i).getKey(), actual.get(i).getKey());
+      List<Edge> expEdges = new ArrayList<>(expected.get(i).getValue());
+      List<Edge> actEdges = new ArrayList<>(actual.get(i).getValue());
+      expEdges.sort(edgeComparator);
+      actEdges.sort(edgeComparator);
+      assertEquals(expEdges, actEdges);
+    }
+
+    Mockito.verify(mockMcfNodesWithoutTypeCounter, Mockito.times(1)).inc();
+  }
+
+  @Test
+  public void testGraphToNodesAndEdgesPCollectionAndMutations() {
+    McfGraph graph =
+        McfGraph.newBuilder()
+            .setType(McfType.INSTANCE_MCF)
+            .putNodes(
+                "dcid0",
+                PropertyValues.newBuilder()
+                    .putPvs(
+                        "name",
+                        McfGraph.Values.newBuilder()
+                            .addTypedValues(
+                                TypedValue.newBuilder()
+                                    .setType(ValueType.TEXT)
+                                    .setValue("Node Zero"))
+                            .build())
+                    .putPvs(
+                        "typeOf",
+                        McfGraph.Values.newBuilder()
+                            .addTypedValues(
+                                TypedValue.newBuilder()
+                                    .setType(ValueType.RESOLVED_REF)
+                                    .setValue("Class"))
+                            .build())
+                    .build())
+            .build();
+
+    SpannerClient spannerClient =
+        SpannerClient.builder()
+            .gcpProjectId("test-project")
+            .spannerInstanceId("test-instance")
+            .spannerDatabaseId("test-db")
+            .build();
+    Counter invalidTypeCounter = Metrics.counter(GraphReaderTest.class, "invalid_type");
+    Counter nodeCounter = Metrics.counter(GraphReaderTest.class, "nodes");
+    Counter edgeCounter = Metrics.counter(GraphReaderTest.class, "edges");
+
+    PCollection<McfGraph> inputGraph = pipeline.apply("CreateGraph", Create.of(graph));
+    PCollection<KV<Node, List<Edge>>> nodesAndEdges =
+        GraphReader.graphToNodesAndEdges("test", inputGraph, "dc/base/Test", invalidTypeCounter);
+    PCollection<Mutation> nodeMutations =
+        GraphReader.nodesToMutations("test", nodesAndEdges, spannerClient, nodeCounter);
+    PCollection<Mutation> edgeMutations =
+        GraphReader.edgesToMutations("test", nodesAndEdges, spannerClient, edgeCounter);
+
+    Node expectedSubjectNode =
+        Node.builder()
+            .subjectId("dcid0")
+            .value("dcid0")
+            .name("Node Zero")
+            .types(List.of("Class"))
+            .build();
+    Node expectedLeafNode =
+        Node.builder()
+            .subjectId("Node Zero:kUyRupzrJkxe/HIOIctxlJX4woEGeOTtlVwqyXYnfDE=")
+            .value("Node Zero")
+            .build();
+    Edge expectedNameEdge =
+        Edge.builder()
+            .subjectId("dcid0")
+            .predicate("name")
+            .objectId("Node Zero:kUyRupzrJkxe/HIOIctxlJX4woEGeOTtlVwqyXYnfDE=")
+            .provenance("dc/base/Test")
+            .build();
+    Edge expectedTypeEdge =
+        Edge.builder()
+            .subjectId("dcid0")
+            .predicate("typeOf")
+            .objectId("Class")
+            .provenance("dc/base/Test")
+            .build();
+
+    PAssert.that(nodeMutations)
+        .containsInAnyOrder(
+            spannerClient.toNodeMutation(expectedSubjectNode),
+            spannerClient.toNodeMutation(expectedLeafNode));
+    PAssert.that(edgeMutations)
+        .containsInAnyOrder(
+            spannerClient.toEdgeMutation(expectedNameEdge),
+            spannerClient.toEdgeMutation(expectedTypeEdge));
+
+    pipeline.run().waitUntilFinish();
   }
 }

@@ -13,11 +13,13 @@ import org.apache.beam.sdk.options.PipelineOptionsFactory;
 import org.apache.beam.sdk.transforms.Create;
 import org.apache.beam.sdk.transforms.MapElements;
 import org.apache.beam.sdk.transforms.Reshuffle;
-import org.apache.beam.sdk.transforms.Values;
 import org.apache.beam.sdk.transforms.Wait;
+import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.PCollectionTuple;
 import org.apache.beam.sdk.values.TypeDescriptor;
+import org.datacommons.ingestion.data.Edge;
+import org.datacommons.ingestion.data.Node;
 import org.datacommons.ingestion.data.Observation;
 import org.datacommons.ingestion.data.ProvenanceUtils;
 import org.datacommons.ingestion.data.TimeSeries;
@@ -263,23 +265,16 @@ public class GraphIngestionPipeline {
               org.apache.beam.sdk.transforms.ParDo.of(new GraphTransformer(isBaseDc)));
     }
 
-    // Convert all nodes to mutations
+    // Convert transformed graph to a PCollection of <Node, List<Edge>>
+    PCollection<KV<Node, List<Edge>>> nodesAndEdges =
+        GraphReader.graphToNodesAndEdges(
+            importName, transformedGraph, provenance, nodeInvalidTypeCounter);
+
+    // Extract node and edge mutations from nodesAndEdges
     PCollection<Mutation> nodeMutations =
-        GraphReader.graphToNodes(
-                "NodeMutations-" + importName,
-                transformedGraph,
-                spannerClient,
-                nodeCounter,
-                nodeInvalidTypeCounter)
-            .apply("ExtractNodeMutations-" + importName, Values.create());
+        GraphReader.nodesToMutations(importName, nodesAndEdges, spannerClient, nodeCounter);
     PCollection<Mutation> edgeMutations =
-        GraphReader.graphToEdges(
-                "EdgeMutations-" + importName,
-                transformedGraph,
-                provenance,
-                spannerClient,
-                edgeCounter)
-            .apply("ExtractEdgeMutations-" + importName, Values.create());
+        GraphReader.edgesToMutations(importName, nodesAndEdges, spannerClient, edgeCounter);
 
     PCollection<TimeSeries> uniqueSeries =
         GraphReader.extractUniqueSeries(observationNodes, importName, isBaseDc, timeSeriesCounter);
